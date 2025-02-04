@@ -12,7 +12,7 @@ mod prelude {
 use crate::prelude::*;
 use std::{
     fs::File,
-    net::{SocketAddr, TcpStream},
+    net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs},
 };
 
 use aes_gcm_1::{AesDecrypt, AesEncrypt, CIPHERTEXT_CHUNK_SIZE};
@@ -20,6 +20,7 @@ use console::{style, Term};
 use flate2::{bufread::GzEncoder, read::GzDecoder};
 
 const PROTOCOL_VERSION: (u32, u32) = (1, 0);
+const DEFAULT_PORT: u16 = 56273;
 
 mod aes_gcm_1;
 
@@ -152,8 +153,8 @@ fn send(term: Term) -> Result<()> {
 
     let file = GzEncoder::new(file, flate2::Compression::fast());
     let mut file = AesEncrypt::new(pass.as_bytes(), file)?;
-    let listener = std::net::TcpListener::bind("0.0.0.0:56273")?;
-    println!("Listening on post 56273...");
+    let listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT))?;
+    println!("Listening on port {DEFAULT_PORT}...");
     let (mut stream, addr) = listener.accept()?;
     println!("Connection from {}, beaming over...", addr);
     send_value(
@@ -184,11 +185,41 @@ fn send(term: Term) -> Result<()> {
     Ok(())
 }
 
+fn parse_host(host: &str) -> Result<Vec<SocketAddr>> {
+    if let Ok(addrs) = host.to_socket_addrs() {
+        return Ok(addrs.collect());
+    }
+    (host, DEFAULT_PORT)
+        .to_socket_addrs()
+        .map(|addrs| addrs.collect())
+        .context("could not resolve hostname")
+}
+
+fn connect_to_host(host: &str) -> Result<TcpStream> {
+    let addrs = parse_host(&host)?;
+    if addrs.is_empty() {
+        bail!("host does not resolve to any ips")
+    }
+    let mut errs = vec![];
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(6)) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => {
+                errs.push(err);
+            }
+        }
+    }
+    let mut msg = "failed to resolve host:".to_string();
+    for err in errs {
+        use std::fmt::Write;
+        write!(msg, "\n  {}", err)?;
+    }
+    bail!("{msg}");
+}
+
 fn recv(term: Term) -> Result<()> {
-    let addr = ask_line(&term, "Enter the address of the remote server", |_| true)?;
-    let addr: SocketAddr = addr.parse().context("invalid server address")?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(6))
-        .context("failed to connect to server")?;
+    let host = ask_line(&term, "Enter the address of the remote server", |_| true)?;
+    let mut stream = connect_to_host(&host)?;
     let header: Header = recv_value(&mut stream)?;
     ensure!(header.protocol == "dirsend", "invalid protocol");
     ensure!(header.version.0 == 1, "incompatible protocol version");
