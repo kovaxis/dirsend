@@ -6,6 +6,7 @@ Simply run the executable and follow the instructions, usable even for non-techn
 
 ## Usage
 
+0. [Download](https://github.com/kovaxis/dirsend/releases) or compile the `dirsend` binary on both the sender and receiver.
 1. Run `dirsend` on the sender.
 2. Select your file and password.
 3. Run `dirsend` on the receiver.
