@@ -22,17 +22,14 @@ fn init_aes_cipher(pass: &[u8], salt: [u8; 32]) -> Result<(Aes256Gcm, u128)> {
     Ok((cipher, u128::from_le_bytes(nonce)))
 }
 
-pub struct AesEncrypt<R> {
-    inner: R,
+pub struct AesEncrypt<W: Write> {
+    inner: W,
     cipher: Aes256Gcm,
     nonce: u128,
-    last_chunk: bool,
-    buf: Box<[u8]>,
-    buf_len: usize,
-    buf_skip: usize,
+    buf: Vec<u8>,
 }
-impl<R: Read> AesEncrypt<R> {
-    pub fn new(pass: &[u8], inner: R) -> Result<Self> {
+impl<W: Write> AesEncrypt<W> {
+    pub fn new(pass: &[u8], mut inner: W) -> Result<Self> {
         let salt = {
             let mut buf = [0u8; SALT_SIZE];
             getrandom::fill(&mut buf).map_err(|e| anyhow!("getrandom error: {}", e))?;
@@ -40,39 +37,19 @@ impl<R: Read> AesEncrypt<R> {
         };
         let (cipher, nonce) = init_aes_cipher(pass, salt)?;
 
-        let mut buf = vec![0u8; usize::max(SALT_SIZE, CIPHERTEXT_CHUNK_SIZE)].into_boxed_slice();
-        buf[..SALT_SIZE].copy_from_slice(&salt[..]);
+        inner.write_all(&salt)?;
+        let mut buf = Vec::with_capacity(CIPHERTEXT_CHUNK_SIZE);
+        buf.extend(std::iter::repeat_n(0u8, AES_TAG_SIZE));
         Ok(Self {
             inner,
             cipher,
             nonce,
             buf,
-            buf_len: SALT_SIZE,
-            buf_skip: 0,
-            last_chunk: false,
         })
     }
 
-    /// Expects a buffer of size at least `CIPHERTEXT_CHUNK_SIZE`.
-    fn fill_buf(&mut self) -> io::Result<usize> {
-        // Read plaintext into buffer
-        let mut filled = AES_TAG_SIZE;
-        while filled < CIPHERTEXT_CHUNK_SIZE {
-            let n = self
-                .inner
-                .read(&mut self.buf[filled..CIPHERTEXT_CHUNK_SIZE])?;
-            if n == 0 {
-                break;
-            }
-            filled += n;
-        }
-        eprintln!("read {} bytes of plaintext", filled - AES_TAG_SIZE);
-        if filled < CIPHERTEXT_CHUNK_SIZE {
-            self.last_chunk = true;
-        }
-        if filled == 0 {
-            return Ok(0);
-        }
+    /// Assumes `self.buf` has length at least `AES_TAG_SIZE`.
+    fn encrypt_buf(&mut self) -> io::Result<()> {
         // Get next nonce
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&self.nonce.to_le_bytes()[..12]);
@@ -80,42 +57,40 @@ impl<R: Read> AesEncrypt<R> {
         // Encrypt buffer
         let tag: [u8; AES_TAG_SIZE] = self
             .cipher
-            .encrypt_in_place_detached(&nonce.into(), &[], &mut self.buf[AES_TAG_SIZE..filled])
+            .encrypt_in_place_detached(&nonce.into(), &[], &mut self.buf[AES_TAG_SIZE..])
             .map_err(|_e| io::Error::new(io::ErrorKind::Other, "aes encryption error"))?
             .into();
         // Write tag into buffer
         self.buf[..AES_TAG_SIZE].copy_from_slice(&tag[..]);
-        Ok(filled)
+        Ok(())
     }
 }
-impl<R> Read for AesEncrypt<R>
+impl<W> Write for AesEncrypt<W>
 where
-    R: Read,
+    W: Write,
 {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // Refill buffer if it is empty
-        if self.buf_skip >= self.buf_len {
-            eprintln!("refilling encrypt buf");
-            // If we already reached the last chunk, short-circuit
-            if self.last_chunk {
-                return Ok(0);
-            }
-            // Fill the inner buffer
-            let filled = self.fill_buf()?;
-            self.buf_skip = 0;
-            self.buf_len = filled;
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.buf.len() >= CIPHERTEXT_CHUNK_SIZE {
+            self.flush()?;
         }
-        // Read from the buffer
-        let to_read = usize::min(buf.len(), self.buf_len - self.buf_skip);
-        eprintln!(
-            "reading encrypt buf {}..{} out of {}",
-            self.buf_skip,
-            self.buf_skip + to_read,
-            self.buf_len
-        );
-        buf[..to_read].copy_from_slice(&self.buf[self.buf_skip..self.buf_skip + to_read]);
-        self.buf_skip += to_read;
-        Ok(to_read)
+        let to_write = usize::min(buf.len(), CIPHERTEXT_CHUNK_SIZE - self.buf.len());
+        self.buf.extend_from_slice(&buf[..to_write]);
+        Ok(to_write)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.encrypt_buf()?;
+        self.inner.write_all(&self.buf)?;
+        self.buf.truncate(AES_TAG_SIZE);
+        Ok(())
+    }
+}
+impl<W> Drop for AesEncrypt<W>
+where
+    W: Write,
+{
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -219,15 +194,21 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::io::Read;
+    use std::io::{Read, Write};
 
     use super::{AesDecrypt, AesEncrypt, CIPHERTEXT_CHUNK_SIZE, PLAINTEXT_CHUNK_SIZE};
 
     fn test_roundtrip(input: &[u8]) {
-        let enc = AesEncrypt::new(b"my password", input).unwrap();
-        let mut dec = AesDecrypt::new(b"my password", enc).unwrap();
+        let mut cipher = Vec::new();
+        {
+            let mut enc = AesEncrypt::new(b"my password", &mut cipher).unwrap();
+            enc.write_all(input).unwrap();
+        }
         let mut output = vec![];
-        dec.read_to_end(&mut output).unwrap();
+        {
+            let mut dec = AesDecrypt::new(b"my password", &cipher[..]).unwrap();
+            dec.read_to_end(&mut output).unwrap();
+        }
         assert_eq!(input, output);
     }
 

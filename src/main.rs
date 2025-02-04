@@ -3,7 +3,7 @@ mod prelude {
     pub use serde::{Deserialize, Serialize};
     pub use std::{
         fmt,
-        io::{self, BufReader, Read, Write},
+        io::{self, Read, Write},
         path::PathBuf,
         time::Duration,
     };
@@ -15,9 +15,9 @@ use std::{
     net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs},
 };
 
-use aes_gcm_1::{AesDecrypt, AesEncrypt, CIPHERTEXT_CHUNK_SIZE};
+use aes_gcm_1::{AesDecrypt, AesEncrypt};
 use console::{style, Term};
-use flate2::{bufread::GzEncoder, read::GzDecoder};
+use flate2::{read::GzDecoder, write::GzEncoder};
 
 const PROTOCOL_VERSION: (u32, u32) = (1, 0);
 const DEFAULT_PORT: u16 = 56273;
@@ -101,6 +101,8 @@ struct Header {
     protocol: String,
     version: (u32, u32),
     filename: String,
+    #[serde(default)]
+    is_dir: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     encryption: Option<String>,
@@ -136,6 +138,11 @@ where
 }
 
 fn send(term: Term) -> Result<()> {
+    enum Source {
+        File(File),
+        Dir(PathBuf),
+    }
+
     let path = PathBuf::from(ask_line(
         &term,
         "Enter the path of the file/directory to send",
@@ -146,40 +153,53 @@ fn send(term: Term) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow!("invalid utf-8 path"))?
         .to_string();
-    let file = File::open(&path).context("open file")?;
-    let file = BufReader::new(file);
+    let source = if path.canonicalize()?.is_dir() {
+        Source::Dir(path.clone())
+    } else {
+        Source::File(File::open(&path).context("open file")?)
+    };
 
     let pass = ask_secure_line(&term, "Enter password", |_| true)?;
 
-    let file = GzEncoder::new(file, flate2::Compression::fast());
-    let mut file = AesEncrypt::new(pass.as_bytes(), file)?;
     let listener = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT))?;
     println!("Listening on port {DEFAULT_PORT}...");
     let (mut stream, addr) = listener.accept()?;
     println!("Connection from {}, beaming over...", addr);
+
     send_value(
         &mut stream,
         Header {
             protocol: "dirsend".into(),
             version: PROTOCOL_VERSION,
             filename,
+            is_dir: match &source {
+                Source::File(..) => false,
+                Source::Dir(..) => true,
+            },
             encryption: Some("aes-gcm-1".into()),
             compression: Some("gzip".into()),
         },
     )?;
-    let mut buf = vec![0u8; CIPHERTEXT_CHUNK_SIZE];
-    loop {
-        let read_bytes = file.read(&mut buf[..]).context("file read error")?;
-        if read_bytes == 0 {
-            break;
+
+    let stream = AesEncrypt::new(pass.as_bytes(), stream)?;
+    let mut stream = GzEncoder::new(stream, flate2::Compression::fast());
+
+    let filetype = match source {
+        Source::File(mut file) => {
+            io::copy(&mut file, &mut stream).context("upload error")?;
+            "file"
         }
-        stream
-            .write_all(&buf[..read_bytes])
-            .context("network upload error")?;
-    }
+        Source::Dir(path) => {
+            let mut archive = tar::Builder::new(stream);
+            archive.append_dir_all("", path)?;
+            archive.finish()?;
+            "directory"
+        }
+    };
     println!(
-        "{} Uploaded file at {}",
+        "{} Uploaded {} at {}",
         style("Success!").green().bold(),
+        filetype,
         path.display(),
     );
     Ok(())
@@ -282,22 +302,21 @@ fn recv(term: Term) -> Result<()> {
         }
     }
 
-    let mut file = File::create_new(&path)?;
-    let mut buf = vec![0u8; CIPHERTEXT_CHUNK_SIZE];
-    loop {
-        let read_bytes = stream
-            .read(&mut buf[..])
-            .context("network download error")?;
-        if read_bytes == 0 {
-            break;
-        }
-        file.write_all(&buf[..read_bytes])
-            .context("file write error")?;
-    }
+    let filetype = if header.is_dir {
+        let mut archive = tar::Archive::new(stream);
+        std::fs::create_dir(&path).context("failed to create output directory")?;
+        archive.unpack(&path).context("download error")?;
+        "directory"
+    } else {
+        let mut file = File::create_new(&path)?;
+        io::copy(&mut stream, &mut file).context("download error")?;
+        "file"
+    };
 
     println!(
-        "{} Downloaded to {}",
+        "{} Downloaded {} to {}",
         style("Success!").green().bold(),
+        filetype,
         path.display(),
     );
 
