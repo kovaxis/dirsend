@@ -37,12 +37,9 @@ fn ask_char<T>(
     write!(term, "{} ", style(s).cyan().bold())?;
     loop {
         let c = term.read_char()?;
-        match acc(c) {
-            Some(t) => {
-                writeln!(term, "{}", c)?;
-                break Ok(t);
-            }
-            None => {}
+        if let Some(t) = acc(c) {
+            writeln!(term, "{}", c)?;
+            break Ok(t);
         }
     }
 }
@@ -216,7 +213,7 @@ fn parse_host(host: &str) -> Result<Vec<SocketAddr>> {
 }
 
 fn connect_to_host(host: &str) -> Result<TcpStream> {
-    let addrs = parse_host(&host)?;
+    let addrs = parse_host(host)?;
     if addrs.is_empty() {
         bail!("host does not resolve to any ips")
     }
